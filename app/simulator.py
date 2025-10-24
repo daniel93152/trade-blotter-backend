@@ -57,17 +57,23 @@ class CurveSimulator:
         # Store start-of-day parameters for delta calculation
         self.sod_params = (beta0, beta1, beta2)
         
+        # Per-bucket adjustments (independent of Nelson-Siegel)
+        # This allows individual tenors to drift independently
+        self.bucket_adjustments = {tenor: 0.0 for tenor in self.TENOR_MAP.keys()}
+        
         logger.info(
             f"CurveSimulator initialized: β₀={beta0:.4f}, β₁={beta1:.4f}, "
             f"β₂={beta2:.4f}, λ={lambda_param:.4f}"
         )
     
-    def nelson_siegel(self, tenor_years: float) -> float:
+    def nelson_siegel(self, tenor_years: float, tenor_name: str = None) -> float:
         """
         Calculate yield for a given tenor using Nelson-Siegel formula
+        plus per-bucket adjustments
         
         Args:
             tenor_years: Time to maturity in years
+            tenor_name: Tenor name (e.g., '3M', '1Y') for bucket adjustment
             
         Returns:
             Yield as a decimal (e.g., 0.05 for 5%)
@@ -77,15 +83,18 @@ class CurveSimulator:
         
         # Avoid division by zero
         if t < 1e-10:
-            return self.beta0 + self.beta1
+            base_yield = self.beta0 + self.beta1
+        else:
+            # Nelson-Siegel formula components
+            factor1 = (1 - np.exp(-lam * t)) / (lam * t)
+            factor2 = factor1 - np.exp(-lam * t)
+            base_yield = self.beta0 + self.beta1 * factor1 + self.beta2 * factor2
         
-        # Nelson-Siegel formula components
-        factor1 = (1 - np.exp(-lam * t)) / (lam * t)
-        factor2 = factor1 - np.exp(-lam * t)
+        # Add bucket-specific adjustment if tenor name provided
+        if tenor_name and tenor_name in self.bucket_adjustments:
+            base_yield += self.bucket_adjustments[tenor_name]
         
-        yield_value = self.beta0 + self.beta1 * factor1 + self.beta2 * factor2
-        
-        return yield_value
+        return base_yield
     
     def apply_drift(self, volatility: float = 0.0001):
         """
@@ -111,12 +120,11 @@ class CurveSimulator:
         """
         Apply drift to random tenor buckets only
         
-        Instead of updating all tenors, this randomly selects a subset
-        of buckets to update, creating more realistic market movement
-        where not all tenors move simultaneously.
+        This updates only selected buckets independently, creating realistic
+        market movement where not all tenors move simultaneously.
         
         Args:
-            volatility: Standard deviation of the random drift
+            volatility: Standard deviation of the random drift (in yield units)
             num_buckets: Number of buckets to update (None = random 1-4 buckets)
         """
         # Randomly decide how many buckets to update (1-4 buckets)
@@ -127,39 +135,15 @@ class CurveSimulator:
         all_tenors = list(self.TENOR_MAP.keys())
         selected_tenors = np.random.choice(all_tenors, size=num_buckets, replace=False)
         
-        # Store deltas for selected buckets only
-        # We simulate this by applying parameter drifts weighted by which tenors are selected
-        # Short-term tenors (3M, 6M, 1Y) affect beta1 more
-        # Medium-term tenors (2Y, 5Y) affect beta2 more  
-        # Long-term tenors (10Y, 30Y) affect beta0 more
-        
-        short_term = {'3M', '6M', '1Y'}
-        medium_term = {'2Y', '5Y'}
-        long_term = {'10Y', '30Y'}
-        
-        selected_set = set(selected_tenors)
-        
-        # Apply weighted drift based on selected buckets
-        if selected_set & short_term:
-            # Short-term bucket selected: affect slope (beta1)
-            self.beta1 += np.random.normal(0, volatility * 2)
-        
-        if selected_set & medium_term:
-            # Medium-term bucket selected: affect curvature (beta2)
-            self.beta2 += np.random.normal(0, volatility * 1.5)
-        
-        if selected_set & long_term:
-            # Long-term bucket selected: affect level (beta0)
-            self.beta0 += np.random.normal(0, volatility)
-        
-        # Always apply small baseline drift to all parameters for stability
-        self.beta0 += np.random.normal(0, volatility * 0.3)
-        self.beta1 += np.random.normal(0, volatility * 0.3)
-        self.beta2 += np.random.normal(0, volatility * 0.3)
+        # Apply random drift ONLY to selected buckets
+        for tenor in selected_tenors:
+            # Each bucket gets an independent random shock
+            drift = np.random.normal(0, volatility)
+            self.bucket_adjustments[tenor] += drift
         
         logger.debug(
             f"Applied drift to {num_buckets} buckets {list(selected_tenors)}: "
-            f"β₀={self.beta0:.4f}, β₁={self.beta1:.4f}, β₂={self.beta2:.4f}"
+            f"adjustments = {{{', '.join(f'{t}: {self.bucket_adjustments[t]:.6f}' for t in selected_tenors)}}}"
         )
     
     def get_curve(self, tenors: List[str] = None) -> Dict[str, float]:
@@ -183,13 +167,15 @@ class CurveSimulator:
                 continue
             
             tenor_years = self.TENOR_MAP[tenor]
-            curve[tenor] = self.nelson_siegel(tenor_years)
+            # Pass tenor name to include bucket adjustments
+            curve[tenor] = self.nelson_siegel(tenor_years, tenor_name=tenor)
         
         return curve
     
     def get_sod_curve(self, tenors: List[str] = None) -> Dict[str, float]:
         """
         Generate start-of-day yield curve using SOD parameters
+        (without bucket adjustments)
         
         Args:
             tenors: List of tenor strings
@@ -200,13 +186,25 @@ class CurveSimulator:
         if tenors is None:
             tenors = list(self.TENOR_MAP.keys())
         
-        # Temporarily use SOD parameters
+        # Use SOD parameters directly without bucket adjustments
         beta0_sod, beta1_sod, beta2_sod = self.sod_params
-        beta0_current, beta1_current, beta2_current = self.beta0, self.beta1, self.beta2
         
-        self.beta0, self.beta1, self.beta2 = beta0_sod, beta1_sod, beta2_sod
-        sod_curve = self.get_curve(tenors)
-        self.beta0, self.beta1, self.beta2 = beta0_current, beta1_current, beta2_current
+        sod_curve = {}
+        for tenor in tenors:
+            if tenor not in self.TENOR_MAP:
+                continue
+            
+            tenor_years = self.TENOR_MAP[tenor]
+            t = tenor_years
+            lam = self.lambda_param
+            
+            # Calculate base Nelson-Siegel without bucket adjustments
+            if t < 1e-10:
+                sod_curve[tenor] = beta0_sod + beta1_sod
+            else:
+                factor1 = (1 - np.exp(-lam * t)) / (lam * t)
+                factor2 = factor1 - np.exp(-lam * t)
+                sod_curve[tenor] = beta0_sod + beta1_sod * factor1 + beta2_sod * factor2
         
         return sod_curve
     
@@ -235,9 +233,11 @@ class CurveSimulator:
         return delta
     
     def reset_to_sod(self):
-        """Reset curve parameters to start-of-day values"""
+        """Reset curve parameters and bucket adjustments to start-of-day values"""
         self.beta0, self.beta1, self.beta2 = self.sod_params
-        logger.info("Curve reset to SOD parameters")
+        # Reset all bucket adjustments to zero
+        self.bucket_adjustments = {tenor: 0.0 for tenor in self.TENOR_MAP.keys()}
+        logger.info("Curve and bucket adjustments reset to SOD")
     
     def get_curve_summary(self) -> Dict:
         """

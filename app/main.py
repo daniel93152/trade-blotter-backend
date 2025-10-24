@@ -8,6 +8,8 @@ from app.models import HealthResponse
 from app.routes import api
 from app.simulator import CurveSimulator
 from app.utils import load_positions, load_curve, compute_pnl
+from app.state import market_state
+from app import ws_stream
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +25,7 @@ async def update_curve_task():
     
     This task runs continuously, applying random drifts to selected
     yield curve buckets (not all at once) and recalculating PnL.
+    Updates the shared market_state for consumption by REST and WebSocket.
     """
     logger.info("Starting background curve update task (0.5s interval)...")
     
@@ -30,21 +33,24 @@ async def update_curve_task():
         try:
             await asyncio.sleep(0.5)
             
-            if api.curve_simulator is None or not api.current_positions:
+            if market_state.curve_simulator is None or not market_state.current_positions:
                 logger.warning("Simulator or positions not initialized, skipping update")
                 continue
             
             # Apply drift to random buckets (not all tenors at once)
-            api.curve_simulator.apply_random_bucket_drift(volatility=0.0002)
+            market_state.curve_simulator.apply_random_bucket_drift(volatility=0.0002)
             
             # Recalculate PnL
             tenors = ['3M', '6M', '1Y', '2Y', '5Y', '10Y', '30Y']
-            delta_curve = api.curve_simulator.get_delta(tenors)
-            api.current_positions = compute_pnl(api.current_positions, delta_curve)
+            delta_curve = market_state.curve_simulator.get_delta(tenors)
+            updated_positions = compute_pnl(market_state.current_positions, delta_curve)
+            
+            # Update shared state
+            market_state.update(updated_positions)
             
             # Log summary
             from app.utils import aggregate_pnl
-            total_pnl = aggregate_pnl(api.current_positions)
+            total_pnl = aggregate_pnl(updated_positions)
             max_delta = max(abs(d) for d in delta_curve.values())
             
             logger.info(f"Curve updated - Max delta: {max_delta:+.2f}bp, Total PnL: ${total_pnl:,.2f}")
@@ -96,7 +102,11 @@ async def lifespan(app: FastAPI):
         delta_curve = curve_sim.get_delta(tenors)
         positions = compute_pnl(positions, delta_curve)
         
-        # Set global state in api module
+        # Set global shared state
+        market_state.curve_simulator = curve_sim
+        market_state.update(positions)
+        
+        # Also set api module state for backward compatibility
         api.curve_simulator = curve_sim
         api.current_positions = positions
         
@@ -141,6 +151,8 @@ app = FastAPI(
 )
 
 # CORS configuration for React/Vite frontends
+# Note: WebSocket connections don't use CORS in the same way as HTTP,
+# but we configure CORS for the HTTP endpoints
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -157,6 +169,9 @@ app.add_middleware(
 
 # Include API routes
 app.include_router(api.router, prefix="/api/v1", tags=["Trade Blotter"])
+
+# Include WebSocket streaming
+app.include_router(ws_stream.router, prefix="/api/v1", tags=["WebSocket Streaming"])
 
 
 @app.get("/api/v1/health", response_model=HealthResponse)

@@ -8,12 +8,13 @@ from datetime import datetime
 import logging
 
 from app.models import CurvePoint, Position, PnLResponse
+from app.state import market_state
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Global state (will be initialized at startup)
+# Global state (will be initialized at startup) - kept for backward compatibility
 curve_simulator = None
 current_positions = []
 sod_curve = {}
@@ -30,25 +31,13 @@ async def get_curve():
     - Delta in basis points
     """
     try:
-        if curve_simulator is None:
+        if market_state.curve_simulator is None:
             raise HTTPException(status_code=500, detail="Curve simulator not initialized")
         
         tenors = ['3M', '6M', '1Y', '2Y', '5Y', '10Y', '30Y']
         
-        # Get current and SOD curves
-        current_curve = curve_simulator.get_curve(tenors)
-        sod_curve_data = curve_simulator.get_sod_curve(tenors)
-        delta_curve = curve_simulator.get_delta(tenors)
-        
-        # Build response
-        curve_points = []
-        for tenor in tenors:
-            curve_points.append({
-                'tenor': tenor,
-                'sod_yield': sod_curve_data[tenor],
-                'live_yield': current_curve[tenor],
-                'delta_bp': delta_curve[tenor]
-            })
+        # Use shared market state
+        curve_points = market_state.get_curve_data(tenors)
         
         return curve_points
         
@@ -70,10 +59,10 @@ async def get_positions():
     - Current PnL
     """
     try:
-        if not current_positions:
+        if not market_state.current_positions:
             raise HTTPException(status_code=500, detail="Positions not loaded")
         
-        return current_positions
+        return market_state.current_positions
         
     except Exception as e:
         logger.error(f"Error getting positions: {e}")
@@ -91,16 +80,15 @@ async def get_pnl():
     - Timestamp of calculation
     """
     try:
-        if not current_positions:
+        if not market_state.current_positions:
             raise HTTPException(status_code=500, detail="Positions not loaded")
         
-        # Calculate total PnL
-        from app.utils import aggregate_pnl
-        total_pnl = aggregate_pnl(current_positions)
+        # Get PnL summary from shared state
+        pnl_summary = market_state.get_pnl_summary()
         
         return {
-            'total_pnl': total_pnl,
-            'positions': current_positions,
+            'total_pnl': pnl_summary['total_pnl'],
+            'positions': market_state.current_positions,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
         
@@ -120,19 +108,23 @@ async def reset_curve():
     - Return updated PnL (should be zero)
     """
     try:
-        if curve_simulator is None:
+        if market_state.curve_simulator is None:
             raise HTTPException(status_code=500, detail="Curve simulator not initialized")
         
         # Reset curve
-        curve_simulator.reset_to_sod()
+        market_state.curve_simulator.reset_to_sod()
         
         # Recalculate PnL (should be zero)
         from app.utils import compute_pnl
         tenors = ['3M', '6M', '1Y', '2Y', '5Y', '10Y', '30Y']
-        delta_curve = curve_simulator.get_delta(tenors)
+        delta_curve = market_state.curve_simulator.get_delta(tenors)
         
+        updated_positions = compute_pnl(market_state.current_positions, delta_curve)
+        market_state.update(updated_positions)
+        
+        # Update backward compatibility state
         global current_positions
-        current_positions = compute_pnl(current_positions, delta_curve)
+        current_positions = updated_positions
         
         logger.info("Curve reset to SOD, PnL recalculated")
         
@@ -159,25 +151,21 @@ async def get_summary():
     - Timestamp
     """
     try:
-        if curve_simulator is None or not current_positions:
+        if market_state.curve_simulator is None or not market_state.current_positions:
             raise HTTPException(status_code=500, detail="System not initialized")
         
-        from app.utils import aggregate_pnl
-        
-        summary = curve_simulator.get_curve_summary()
-        total_pnl = aggregate_pnl(current_positions)
-        total_notional = sum(p['notional'] for p in current_positions)
-        total_pv_sod = sum(p['pv_sod'] for p in current_positions)
-        total_pv_live = sum(p['pv_live'] for p in current_positions)
+        summary = market_state.curve_simulator.get_curve_summary()
+        pnl_summary = market_state.get_pnl_summary()
+        total_notional = sum(p['notional'] for p in market_state.current_positions)
         
         return {
             'curve_parameters': summary['parameters'],
             'sod_curve_parameters': summary['sod_parameters'],
-            'position_count': len(current_positions),
+            'position_count': pnl_summary['position_count'],
             'total_notional': total_notional,
-            'total_pv_sod': total_pv_sod,
-            'total_pv_live': total_pv_live,
-            'total_pnl': total_pnl,
+            'total_pv_sod': pnl_summary['total_pv_sod'],
+            'total_pv_live': pnl_summary['total_pv_live'],
+            'total_pnl': pnl_summary['total_pnl'],
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
         
