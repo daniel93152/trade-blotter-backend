@@ -107,6 +107,61 @@ class CurveSimulator:
             f"β₂={self.beta2:.4f}"
         )
     
+    def apply_random_bucket_drift(self, volatility: float = 0.0002, num_buckets: int = None):
+        """
+        Apply drift to random tenor buckets only
+        
+        Instead of updating all tenors, this randomly selects a subset
+        of buckets to update, creating more realistic market movement
+        where not all tenors move simultaneously.
+        
+        Args:
+            volatility: Standard deviation of the random drift
+            num_buckets: Number of buckets to update (None = random 1-4 buckets)
+        """
+        # Randomly decide how many buckets to update (1-4 buckets)
+        if num_buckets is None:
+            num_buckets = np.random.randint(1, 5)
+        
+        # Randomly select which buckets to update
+        all_tenors = list(self.TENOR_MAP.keys())
+        selected_tenors = np.random.choice(all_tenors, size=num_buckets, replace=False)
+        
+        # Store deltas for selected buckets only
+        # We simulate this by applying parameter drifts weighted by which tenors are selected
+        # Short-term tenors (3M, 6M, 1Y) affect beta1 more
+        # Medium-term tenors (2Y, 5Y) affect beta2 more  
+        # Long-term tenors (10Y, 30Y) affect beta0 more
+        
+        short_term = {'3M', '6M', '1Y'}
+        medium_term = {'2Y', '5Y'}
+        long_term = {'10Y', '30Y'}
+        
+        selected_set = set(selected_tenors)
+        
+        # Apply weighted drift based on selected buckets
+        if selected_set & short_term:
+            # Short-term bucket selected: affect slope (beta1)
+            self.beta1 += np.random.normal(0, volatility * 2)
+        
+        if selected_set & medium_term:
+            # Medium-term bucket selected: affect curvature (beta2)
+            self.beta2 += np.random.normal(0, volatility * 1.5)
+        
+        if selected_set & long_term:
+            # Long-term bucket selected: affect level (beta0)
+            self.beta0 += np.random.normal(0, volatility)
+        
+        # Always apply small baseline drift to all parameters for stability
+        self.beta0 += np.random.normal(0, volatility * 0.3)
+        self.beta1 += np.random.normal(0, volatility * 0.3)
+        self.beta2 += np.random.normal(0, volatility * 0.3)
+        
+        logger.debug(
+            f"Applied drift to {num_buckets} buckets {list(selected_tenors)}: "
+            f"β₀={self.beta0:.4f}, β₁={self.beta1:.4f}, β₂={self.beta2:.4f}"
+        )
+    
     def get_curve(self, tenors: List[str] = None) -> Dict[str, float]:
         """
         Generate current yield curve for standard tenors
